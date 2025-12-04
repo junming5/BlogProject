@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -70,6 +71,11 @@ type PostRequest struct {
 	Content string `json:"content" binding:"required"`
 }
 
+// CommentRequest 用于接收创建评论请求的输入
+type CommentRequest struct {
+	Content string `json:"content" binding:"required"`
+}
+
 // --- 认证 Handler (Auth Handlers) ---
 
 // Register 处理用户注册
@@ -77,7 +83,7 @@ func Register(c *gin.Context) {
 	var input RegisterRequest
 	// 使用 ShouldBindJSON 绑定输入数据，同时进行必要的验证
 	if err := c.ShouldBindJSON(&input); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Invalid input: %v", err.Error())})
 		return
 	}
 
@@ -91,7 +97,8 @@ func Register(c *gin.Context) {
 	// 密码加密
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(input.Password), bcrypt.DefaultCost)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
+		log.Printf("ERROR: Failed to hash password for user %s: %v", input.Username, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Internal server error during password hashing"})
 		return
 	}
 
@@ -103,10 +110,12 @@ func Register(c *gin.Context) {
 	}
 
 	if err := DB.Create(&user).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create user in database"})
+		log.Printf("ERROR: Failed to create user %s in database: %v", input.Username, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to register user due to database error"})
 		return
 	}
 
+	log.Printf("INFO: User registered successfully: %s", user.Username)
 	c.JSON(http.StatusCreated, gin.H{"message": "User registered successfully"})
 }
 
@@ -141,14 +150,15 @@ func Login(c *gin.Context) {
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-
 	// 使用全局密钥签名 Token
 	tokenString, err := token.SignedString(jwtSecret)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
+		log.Printf("ERROR: Failed to generate token for user %s: %v", storedUser.Username, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate authentication token"})
 		return
 	}
 
+	log.Printf("INFO: User logged in successfully: %s", storedUser.Username)
 	c.JSON(http.StatusOK, gin.H{"token": tokenString})
 }
 
@@ -190,6 +200,7 @@ func AuthRequired() gin.HandlerFunc {
 			c.Set("user_id", userID)
 			c.Set("username", claims["username"])
 		} else {
+			log.Printf("WARNING: Token valid but claims extraction failed.")
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Token claims invalid"})
 			c.Abort()
 			return
@@ -207,13 +218,15 @@ func CreatePost(c *gin.Context) {
 	var input PostRequest
 
 	if err := c.ShouldBindJSON(&input); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Binding error: %v", err.Error())})
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Invalid input: %v", err.Error())})
 		return
 	}
 
 	userID, exists := c.Get("user_id")
 	if !exists {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "User ID not found in context"})
+		// 如果中间件设置失败，可能是内部错误
+		log.Printf("ERROR: User ID missing from context in CreatePost handler.")
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication context error"})
 		return
 	}
 
@@ -224,10 +237,12 @@ func CreatePost(c *gin.Context) {
 	}
 
 	if err := DB.Create(&post).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create post in database"})
+		log.Printf("ERROR: Failed to create post for user ID %d: %v", userID.(uint), err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save post to database"})
 		return
 	}
 
+	log.Printf("INFO: Post created successfully by user ID %d, Post ID: %d", userID.(uint), post.ID)
 	c.JSON(http.StatusCreated, gin.H{
 		"message": "Post created successfully",
 		"post_id": post.ID,
@@ -241,6 +256,7 @@ func GetPosts(c *gin.Context) {
 	// Preload("User") 确保同时加载关联的 User 信息
 	// 忽略软删除的文章 (DeletedAt is NULL)
 	if err := DB.Preload("User").Order("created_at desc").Find(&posts).Error; err != nil {
+		log.Printf("ERROR: Failed to retrieve posts from database: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve posts"})
 		return
 	}
@@ -256,7 +272,12 @@ func GetPost(c *gin.Context) {
 
 	// Preload("User") 和 Preload("Comments")
 	if err := DB.Preload("User").Preload("Comments").First(&post, id).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Post not found"})
+		if err == gorm.ErrRecordNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("Post not found with ID: %s", id)})
+			return
+		}
+		log.Printf("ERROR: Failed to retrieve post ID %s from database: %v", id, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve post"})
 		return
 	}
 
@@ -271,12 +292,18 @@ func UpdatePost(c *gin.Context) {
 	// 1. 查找文章并检查作者
 	var post Post
 	if err := DB.First(&post, id).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Post not found"})
+		if err == gorm.ErrRecordNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("Post not found with ID: %s", id)})
+			return
+		}
+		log.Printf("ERROR: Failed to retrieve post ID %s for update: %v", id, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error while fetching post"})
 		return
 	}
 
 	// 2. 授权检查：确保当前用户是文章作者
 	if post.UserID != userID {
+		log.Printf("WARNING: User ID %d attempted to update post ID %d owned by user ID %d", userID, post.ID, post.UserID)
 		c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied: You are not the author of this post"})
 		return
 	}
@@ -284,16 +311,21 @@ func UpdatePost(c *gin.Context) {
 	// 3. 绑定更新数据
 	var input PostRequest
 	if err := c.ShouldBindJSON(&input); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Binding error: %v", err.Error())})
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Invalid update input: %v", err.Error())})
 		return
 	}
 
 	// 4. 更新字段并保存
-	DB.Model(&post).Updates(map[string]interface{}{
+	if res := DB.Model(&post).Updates(map[string]interface{}{
 		"Title":   input.Title,
 		"Content": input.Content,
-	})
+	}); res.Error != nil {
+		log.Printf("ERROR: Failed to update post ID %d by user ID %d: %v", post.ID, userID, res.Error)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update post in database"})
+		return
+	}
 
+	log.Printf("INFO: Post ID %d updated successfully by user ID %d", post.ID, userID)
 	c.JSON(http.StatusOK, gin.H{"message": "Post updated successfully"})
 }
 
@@ -305,23 +337,108 @@ func DeletePost(c *gin.Context) {
 	// 1. 查找文章并检查作者
 	var post Post
 	if err := DB.First(&post, id).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Post not found"})
+		if err == gorm.ErrRecordNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("Post not found with ID: %s", id)})
+			return
+		}
+		log.Printf("ERROR: Failed to retrieve post ID %s for deletion: %v", id, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error while fetching post"})
 		return
 	}
 
 	// 2. 授权检查：确保当前用户是文章作者
 	if post.UserID != userID {
+		log.Printf("WARNING: User ID %d attempted to delete post ID %d owned by user ID %d", userID, post.ID, post.UserID)
 		c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied: You are not the author of this post"})
 		return
 	}
 
 	// 3. 删除文章 (GORM 的 gorm.Model 提供了软删除功能)
 	if err := DB.Delete(&post).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete post"})
+		log.Printf("ERROR: Failed to delete post ID %d by user ID %d: %v", post.ID, userID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete post from database"})
 		return
 	}
 
+	log.Printf("INFO: Post ID %d deleted successfully by user ID %d", post.ID, userID)
 	c.JSON(http.StatusOK, gin.H{"message": "Post deleted successfully"})
+}
+
+// --- 评论 CRUD Handlers ---
+
+// CreateComment 处理创建新评论的请求
+func CreateComment(c *gin.Context) {
+	postIDParam := c.Param("id")
+	postID, err := strconv.ParseUint(postIDParam, 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid post ID format"})
+		return
+	}
+
+	var post Post
+	if DB.First(&post, postID).Error != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("Post not found with ID: %d", postID)})
+		return
+	}
+
+	var input CommentRequest
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Invalid input for comment: %v", err.Error())})
+		return
+	}
+
+	userID, exists := c.Get("user_id")
+	if !exists {
+		log.Printf("ERROR: User ID missing from context in CreateComment handler.")
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication context error"})
+		return
+	}
+
+	comment := Comment{
+		Content: input.Content,
+		UserID:  userID.(uint),
+		PostID:  uint(postID),
+	}
+
+	if err := DB.Create(&comment).Error; err != nil {
+		log.Printf("ERROR: Failed to create comment on post ID %d by user ID %d: %v", postID, userID.(uint), err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save comment to database"})
+		return
+	}
+
+	log.Printf("INFO: Comment created successfully on post ID %d by user ID %d", postID, userID.(uint))
+	c.JSON(http.StatusCreated, gin.H{
+		"message":    "Comment created successfully",
+		"comment_id": comment.ID,
+		"post_id":    postID,
+	})
+}
+
+// GetComments 处理获取指定文章下所有评论的请求
+func GetComments(c *gin.Context) {
+	postIDParam := c.Param("id")
+
+	var comments []Comment
+	// Preload("User") 确保同时加载评论作者信息
+	if err := DB.
+		Where("post_id = ?", postIDParam).
+		Preload("User").
+		Order("created_at asc").
+		Find(&comments).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve comments"})
+		return
+	}
+	if res := DB.
+		Where("post_id = ?", postIDParam).
+		Preload("User").
+		Order("created_at asc").
+		Find(&comments); res.Error != nil {
+		log.Printf("ERROR: Failed to retrieve comments for post ID %s: %v", postIDParam, res.Error)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve comments due to database error"})
+		return
+	}
+
+	c.JSON(http.StatusOK, comments)
 }
 
 // --- 初始化与路由 (Initialization and Routing) ---
@@ -350,8 +467,9 @@ func main() {
 	// 获取列表和详情不需要认证
 	postsPublic := r.Group("/api/v1/posts")
 	{
-		postsPublic.GET("", GetPosts)    // GET /api/v1/posts -> 获取所有文章列表
-		postsPublic.GET("/:id", GetPost) // GET /api/v1/posts/:id -> 获取单个文章详情
+		postsPublic.GET("", GetPosts)                 // GET /api/v1/posts -> 获取所有文章列表
+		postsPublic.GET("/:id", GetPost)              // GET /api/v1/posts/:id -> 获取单个文章详情
+		postsPublic.GET("/:id/comments", GetComments) // 获取评论列表
 	}
 
 	// --- 受保护的文章操作路由组 (Protected Posts Group) ---
@@ -359,9 +477,10 @@ func main() {
 	protected := r.Group("/api/v1/posts")
 	protected.Use(AuthRequired()) // 应用认证中间件
 	{
-		protected.POST("", CreatePost)       // POST /api/v1/posts -> 创建文章
-		protected.PUT("/:id", UpdatePost)    // PUT /api/v1/posts/:id -> 更新文章
-		protected.DELETE("/:id", DeletePost) // DELETE /api/v1/posts/:id -> 删除文章
+		protected.POST("", CreatePost)                 // POST /api/v1/posts -> 创建文章
+		protected.PUT("/:id", UpdatePost)              // PUT /api/v1/posts/:id -> 更新文章
+		protected.DELETE("/:id", DeletePost)           // DELETE /api/v1/posts/:id -> 删除文章
+		protected.POST("/:id/comments", CreateComment) // 创建评论
 	}
 
 	// 运行服务器
