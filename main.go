@@ -420,14 +420,6 @@ func GetComments(c *gin.Context) {
 
 	var comments []Comment
 	// Preload("User") 确保同时加载评论作者信息
-	if err := DB.
-		Where("post_id = ?", postIDParam).
-		Preload("User").
-		Order("created_at asc").
-		Find(&comments).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve comments"})
-		return
-	}
 	if res := DB.
 		Where("post_id = ?", postIDParam).
 		Preload("User").
