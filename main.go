@@ -24,9 +24,9 @@ var jwtSecret = []byte("your_super_secret_key_for_blog_system")
 // User 用户模型
 type User struct {
 	gorm.Model
-	Username string `gorm:"unique;not null;type:varchar(50)" binding:"required"`
-	Password string `gorm:"not null;type:varchar(255)" binding:"required"`
-	Email    string `gorm:"unique;not null;type:varchar(100)" binding:"required,email"`
+	Username string `gorm:"unique;not null;type:varchar(50)" json:"username"`
+	Password string `gorm:"not null;type:varchar(255)" json:"password"`
+	Email    string `gorm:"unique;not null;type:varchar(100)" json:"email"`
 	Posts    []Post
 	Comments []Comment
 }
@@ -51,11 +51,24 @@ type Comment struct {
 	Post    Post
 }
 
+// LoginRequest 专门用于接收登录请求的输入
+type LoginRequest struct {
+	Username string `json:"username" binding:"required"`
+	Password string `json:"password" binding:"required"`
+}
+
+// RegisterRequest 专门用于接收注册请求的输入
+type RegisterRequest struct {
+	Username string `json:"username" binding:"required"`
+	Password string `json:"password" binding:"required"`
+	Email    string `json:"email" binding:"required,email"` // 注册时 Email 必须
+}
+
 // --- 控制器函数 (Controller Handlers) ---
 
 // Register 处理用户注册
 func Register(c *gin.Context) {
-	var input User
+	var input RegisterRequest
 	// 使用 ShouldBindJSON 绑定输入数据，同时进行必要的验证
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -93,9 +106,10 @@ func Register(c *gin.Context) {
 
 // Login 处理用户登录并返回 JWT
 func Login(c *gin.Context) {
-	var input User
+	var input LoginRequest
 	if err := c.ShouldBindJSON(&input); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input"})
+		// 返回详细的错误信息，帮助我们定位是哪个字段的绑定出了问题
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Binding error: %v", err.Error())})
 		return
 	}
 
@@ -164,7 +178,7 @@ func main() {
 // InitDB 初始化数据库连接
 func InitDB() {
 	// 🚨 数据库连接字符串 (DSN) - 请确保已正确修改
-	dsn := "root:123456@tcp(127.0.0.1:3306)/blog_db?charset=utf8mb4&parseTime=True&loc=Local"
+	dsn := "root:gormpass@tcp(127.0.0.1:3306)/blog_db?charset=utf8mb4&parseTime=True&loc=Local"
 
 	var err error
 
