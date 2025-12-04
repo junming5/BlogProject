@@ -34,20 +34,20 @@ type User struct {
 // Post 文章模型
 type Post struct {
 	gorm.Model
-	Title    string `gorm:"not null;type:varchar(255)"`
-	Content  string `gorm:"not null;type:text"`
-	UserID   uint
-	User     User
-	Comments []Comment
+	Title    string    `gorm:"not null;type:varchar(255)" json:"title"`
+	Content  string    `gorm:"not null;type:text" json:"content"`
+	UserID   uint      `json:"user_id"`                         // 外键关联 User
+	User     User      `gorm:"foreignKey:UserID" json:"author"` // GORM 关联对象
+	Comments []Comment `json:"comments"`
 }
 
 // Comment 评论模型
 type Comment struct {
 	gorm.Model
-	Content string `gorm:"not null;type:text"`
-	UserID  uint
-	User    User
-	PostID  uint
+	Content string `gorm:"not null;type:text" json:"content"`
+	UserID  uint   `json:"user_id"`
+	User    User   `gorm:"foreignKey:UserID" json:"user"`
+	PostID  uint   `json:"post_id"`
 	Post    Post
 }
 
@@ -64,7 +64,13 @@ type RegisterRequest struct {
 	Email    string `json:"email" binding:"required,email"` // 注册时 Email 必须
 }
 
-// --- 控制器函数 (Controller Handlers) ---
+// PostRequest 用于接收创建和更新文章请求的输入
+type PostRequest struct {
+	Title   string `json:"title" binding:"required"`
+	Content string `json:"content" binding:"required"`
+}
+
+// --- 认证 Handler (Auth Handlers) ---
 
 // Register 处理用户注册
 func Register(c *gin.Context) {
@@ -146,6 +152,178 @@ func Login(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"token": tokenString})
 }
 
+// --- 认证中间件 (Middleware) ---
+
+// AuthRequired 是一个 Gin 中间件，用于验证请求中的 JWT Token
+func AuthRequired() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// 1. 从 Header 中获取 Token: Authorization: Bearer <token>
+		tokenString := c.GetHeader("Authorization")
+		if tokenString == "" || len(tokenString) < 7 || tokenString[:7] != "Bearer " {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Authorization token required"})
+			c.Abort() // 终止后续操作
+			return
+		}
+
+		// 提取实际的 Token 字符串
+		tokenString = tokenString[7:]
+
+		// 2. 解析和验证 Token
+		token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+			// 确保签名方法是 HMAC
+			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, fmt.Errorf("unexpected signing method: %v", token.Method)
+			}
+			return jwtSecret, nil // 使用全局密钥进行验证
+		})
+
+		// 3. 检查解析结果
+		if err != nil || !token.Valid {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired token"})
+			c.Abort()
+			return
+		}
+
+		// 4. 将用户信息（如 UserID）存储在 Context 中，供后续 Handler 使用
+		if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
+			userID := uint(claims["user_id"].(float64)) // JWT number claims are float64
+			c.Set("user_id", userID)
+			c.Set("username", claims["username"])
+		} else {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Token claims invalid"})
+			c.Abort()
+			return
+		}
+
+		// Token 验证通过，继续处理请求
+		c.Next()
+	}
+}
+
+// --- 文章 CRUD Handlers ---
+
+// CreatePost 处理创建新文章的请求 (已更新，使用 PostRequest DTO)
+func CreatePost(c *gin.Context) {
+	var input PostRequest
+
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Binding error: %v", err.Error())})
+		return
+	}
+
+	userID, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "User ID not found in context"})
+		return
+	}
+
+	post := Post{
+		Title:   input.Title,
+		Content: input.Content,
+		UserID:  userID.(uint),
+	}
+
+	if err := DB.Create(&post).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create post in database"})
+		return
+	}
+
+	c.JSON(http.StatusCreated, gin.H{
+		"message": "Post created successfully",
+		"post_id": post.ID,
+		"title":   post.Title,
+	})
+}
+
+// GetPosts 处理获取所有文章列表的请求
+func GetPosts(c *gin.Context) {
+	var posts []Post
+	// Preload("User") 确保同时加载关联的 User 信息
+	// 忽略软删除的文章 (DeletedAt is NULL)
+	if err := DB.Preload("User").Order("created_at desc").Find(&posts).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve posts"})
+		return
+	}
+
+	c.JSON(http.StatusOK, posts)
+}
+
+// GetPost 处理获取单个文章详情的请求
+func GetPost(c *gin.Context) {
+	// 从 URL 参数获取文章 ID
+	id := c.Param("id")
+	var post Post
+
+	// Preload("User") 和 Preload("Comments")
+	if err := DB.Preload("User").Preload("Comments").First(&post, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Post not found"})
+		return
+	}
+
+	c.JSON(http.StatusOK, post)
+}
+
+// UpdatePost 处理更新文章的请求
+func UpdatePost(c *gin.Context) {
+	id := c.Param("id")
+	userID := c.MustGet("user_id").(uint) // 从中间件获取当前用户ID
+
+	// 1. 查找文章并检查作者
+	var post Post
+	if err := DB.First(&post, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Post not found"})
+		return
+	}
+
+	// 2. 授权检查：确保当前用户是文章作者
+	if post.UserID != userID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied: You are not the author of this post"})
+		return
+	}
+
+	// 3. 绑定更新数据
+	var input PostRequest
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("Binding error: %v", err.Error())})
+		return
+	}
+
+	// 4. 更新字段并保存
+	DB.Model(&post).Updates(map[string]interface{}{
+		"Title":   input.Title,
+		"Content": input.Content,
+	})
+
+	c.JSON(http.StatusOK, gin.H{"message": "Post updated successfully"})
+}
+
+// DeletePost 处理删除文章的请求
+func DeletePost(c *gin.Context) {
+	id := c.Param("id")
+	userID := c.MustGet("user_id").(uint) // 从中间件获取当前用户ID
+
+	// 1. 查找文章并检查作者
+	var post Post
+	if err := DB.First(&post, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Post not found"})
+		return
+	}
+
+	// 2. 授权检查：确保当前用户是文章作者
+	if post.UserID != userID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied: You are not the author of this post"})
+		return
+	}
+
+	// 3. 删除文章 (GORM 的 gorm.Model 提供了软删除功能)
+	if err := DB.Delete(&post).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete post"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Post deleted successfully"})
+}
+
 // --- 初始化与路由 (Initialization and Routing) ---
 
 func main() {
@@ -167,6 +345,24 @@ func main() {
 			"status":  "Server is running (MySQL)",
 		})
 	})
+
+	// --- 文章公开读取路由组 (Public Posts Group) ---
+	// 获取列表和详情不需要认证
+	postsPublic := r.Group("/api/v1/posts")
+	{
+		postsPublic.GET("", GetPosts)    // GET /api/v1/posts -> 获取所有文章列表
+		postsPublic.GET("/:id", GetPost) // GET /api/v1/posts/:id -> 获取单个文章详情
+	}
+
+	// --- 受保护的文章操作路由组 (Protected Posts Group) ---
+	// 创建、更新、删除需要 JWT 认证
+	protected := r.Group("/api/v1/posts")
+	protected.Use(AuthRequired()) // 应用认证中间件
+	{
+		protected.POST("", CreatePost)       // POST /api/v1/posts -> 创建文章
+		protected.PUT("/:id", UpdatePost)    // PUT /api/v1/posts/:id -> 更新文章
+		protected.DELETE("/:id", DeletePost) // DELETE /api/v1/posts/:id -> 删除文章
+	}
 
 	// 运行服务器
 	log.Println("服务器正在运行在 :8080...")
